@@ -1,0 +1,90 @@
+[package]
+name = "azul-dll"
+version = "0.0.1"
+authors = ["Felix Schütt <felix.schuett@maps4print.com>"]
+license = "MPL-2.0"
+description = "C-API of Azul GUI"
+homepage = "https://azul.rs/"
+keywords = ["gui", "user-interface", "svg", "graphics", "css" ]
+categories = ["gui"]
+repository = "https://github.com/maps4print/azul"
+edition = "2021"
+autoexamples = false
+
+[[bin]]
+name = "azul-dll"
+path = "main.rs"
+edition = "2021"
+
+[lib]
+name = "azul"
+edition = "2021"
+crate-type = ["cdylib", "staticlib", "rlib"]
+doc = false
+
+[dependencies]
+azul-core = { path = "../core", version = "0.0.2", default-features = false }
+pyo3 = { version = "0.16.5", default-features = false, features = ["abi3", "multiple-pymethods", "extension-module", "macros", "auto-initialize"], optional = true }
+log  = { version = "0.4.17",  default-features = false, optional = true }
+pyo3-log = { version = "0.6.0", default-features = false, optional = true }
+
+[features]
+default = ["std", "logging", "css_parser", "ico", "tga", "hdr", "jpeg", "webp", "pnm", "font_loading", "text_layout", "svg", "xml", "gif", "jpeg", "png", "tiff", "bmp", "link-static"]
+# these are the features that currently HAVE to be present
+# removing any of these features will lead to compile error
+# this will be fixed in the future
+minimal = ["std", "css_parser", "font_loading", "text_layout"]
+std = ["azul-core/std"]
+logging = ["log"]
+use_fern_logger = ["logging"]
+use_pyo3_logger = ["pyo3-log", "logging"]
+css_parser = []
+gif = []
+jpeg = []
+png = []
+tiff = []
+bmp = []
+ico = []
+tga = []
+hdr = []
+webp = []
+pnm = []
+svg = []
+xml = []
+font_loading = []
+text_layout = []
+cdylib = []
+rlib = []
+staticlib = []
+link-static = ["rlib"]
+link-dynamic = ["cdylib", "staticlib"]
+
+# Predefined target configurations
+desktop-cdylib = ["cdylib", "use_fern_logger"]
+desktop-staticlib = ["staticlib", "use_fern_logger"]
+rust-static = ["rlib", "use_fern_logger"]
+python-extension = ["cdylib", "pyo3", "use_pyo3_logger"]
+
+[package.metadata.deb]
+maintainer = "Felix Schütt <felix.schuett@maps4print.com>"
+extended-description = """
+    AZUL GUI Toolkit (https://azul.rs).
+    Cross-platform GUI toolkit written in Rust
+    built using the WebRender rendering engine
+"""
+depends = "$auto"
+section = "utility"
+priority = "optional"
+assets = [
+    ["target/release/libazul.so", "usr/lib/", "755"]
+]
+
+[package.metadata.docs.rs]
+no-default-features = true
+features = [
+    "std", "logging", "css_parser", "image_loading", "ico", "tga",
+    "hdr", "jpeg", "webp", "pnm", "font_loading",
+    "text_layout", "svg", "xml", "gif", "jpeg", "png", "tiff", "bmp",
+    "rlib", "use_fern_logger"
+]
+# rustdoc-args = ["--cfg", "docsrs"]
