@@ -1217,6 +1217,145 @@ impl CallbackInfo {
         self.push_change(CallbackChange::AddThread { thread_id, thread });
     }
 
+    /// Checks for updates ASYNCHRONOUSLY: spawns a background thread that
+    /// reads `AppConfig.updates` (manifest URL, current version, mode),
+    /// applies the install-kind backstops (package-managed binaries never
+    /// self-update) and the anti-downgrade/suspend policy, optionally STAGES
+    /// the artifact (`options.download_automatically` — staging is not
+    /// installing), and invokes `callback(data, info, check)` on the main
+    /// thread with the result. Returns the thread's id.
+    #[cfg(feature = "updater")]
+    pub fn check_for_updates(
+        &mut self,
+        data: RefAny,
+        callback: crate::updater::UpdateCheckCallback,
+        options: crate::updater::UpdateOptions,
+    ) -> ThreadId {
+        let (thread_id, thread) = crate::updater::spawn_update_check(data, callback, options);
+        self.add_thread(thread_id, thread);
+        thread_id
+    }
+
+    /// Records an app-defined COUNTER metric with free-form labels (pass an
+    /// empty vec for none). Labels are sanitized and capped (6 keys, 64-char
+    /// values); every distinct combination counts against the global series
+    /// ceiling. No-op unless the `telemetry` feature is on and the user's
+    /// consent tier collects metrics.
+    #[cfg(feature = "std")]
+    pub fn record_counter(
+        &mut self,
+        name: AzString,
+        value: u64,
+        labels: azul_core::window::StringPairVec,
+    ) {
+        #[cfg(feature = "telemetry")]
+        {
+            let pairs: Vec<(&str, &str)> = labels
+                .as_ref()
+                .iter()
+                .map(|p| (p.key.as_str(), p.value.as_str()))
+                .collect();
+            crate::telemetry::count_with(name.as_str(), value, &pairs);
+        }
+        #[cfg(not(feature = "telemetry"))]
+        {
+            drop((name, value, labels));
+        }
+    }
+
+    /// Records an app-defined HISTOGRAM observation with free-form labels
+    /// (same sanitization/caps as [`Self::record_counter`]).
+    #[cfg(feature = "std")]
+    pub fn record_histogram(
+        &mut self,
+        name: AzString,
+        value: f64,
+        labels: azul_core::window::StringPairVec,
+    ) {
+        #[cfg(feature = "telemetry")]
+        {
+            let pairs: Vec<(&str, &str)> = labels
+                .as_ref()
+                .iter()
+                .map(|p| (p.key.as_str(), p.value.as_str()))
+                .collect();
+            crate::telemetry::observe_with(name.as_str(), value, &pairs);
+        }
+        #[cfg(not(feature = "telemetry"))]
+        {
+            drop((name, value, labels));
+        }
+    }
+
+    /// Sets an app-defined GAUGE with free-form labels (same
+    /// sanitization/caps as [`Self::record_counter`]).
+    #[cfg(feature = "std")]
+    pub fn record_gauge(
+        &mut self,
+        name: AzString,
+        value: f64,
+        labels: azul_core::window::StringPairVec,
+    ) {
+        #[cfg(feature = "telemetry")]
+        {
+            let pairs: Vec<(&str, &str)> = labels
+                .as_ref()
+                .iter()
+                .map(|p| (p.key.as_str(), p.value.as_str()))
+                .collect();
+            crate::telemetry::gauge_with(name.as_str(), value, &pairs);
+        }
+        #[cfg(not(feature = "telemetry"))]
+        {
+            drop((name, value, labels));
+        }
+    }
+
+    /// Opens one of the built-in system dialogs (always CPU-rendered — a
+    /// dialog reporting a problem must not depend on the GPU working):
+    ///
+    /// * `ReportProblem`: captures a screenshot of THIS window, then opens
+    ///   the report dialog (message + optional screenshot/system info →
+    ///   `AppConfig.report_problem` mailbox, or disk without one).
+    /// * `UpdateVersion`: opens the update dialog and starts the async
+    ///   check (manifest + changelog; install only after consent, and only
+    ///   where the install kind permits self-update).
+    #[cfg(all(feature = "std", feature = "widgets", feature = "text_layout"))]
+    pub fn invoke_system_dialog(&mut self, dialog: azul_core::window::SysDialogType) {
+        match dialog {
+            azul_core::window::SysDialogType::ReportProblem => {
+                // Capture BEFORE the dialog exists so it can never be in
+                // its own screenshot. Best-effort: a failed capture still
+                // opens the dialog, just without the attachment.
+                let screenshot = self
+                    .take_screenshot(DomId::ROOT_ID)
+                    .ok();
+                crate::dialogs::report_problem::open(self, screenshot);
+            }
+            azul_core::window::SysDialogType::UpdateVersion => {
+                #[cfg(feature = "updater")]
+                crate::dialogs::update_version::open(self);
+                #[cfg(not(feature = "updater"))]
+                eprintln!(
+                    "[azul] invoke_system_dialog(UpdateVersion): azul-layout was built \
+                     without the `updater` feature; the dialog is unavailable"
+                );
+            }
+            azul_core::window::SysDialogType::TelemetryConsent => {
+                #[cfg(feature = "telemetry")]
+                crate::dialogs::telemetry_consent::open(self);
+                #[cfg(not(feature = "telemetry"))]
+                eprintln!(
+                    "[azul] invoke_system_dialog(TelemetryConsent): azul-layout was built \
+                     without the `telemetry` feature; the dialog is unavailable"
+                );
+            }
+            azul_core::window::SysDialogType::GpuCheck => {
+                crate::dialogs::gpu_check::open(self);
+            }
+        }
+    }
+
     /// Remove a thread from this window (applied after callback returns)
     pub fn remove_thread(&mut self, thread_id: ThreadId) {
         self.push_change(CallbackChange::RemoveThread { thread_id });
@@ -3633,6 +3772,46 @@ impl CallbackInfo {
             .map_err(|e| AzString::from(alloc::format!("PNG encoding failed: {e}")))?;
 
         Ok(png_data)
+    }
+
+    /// Renders ONE NODE to a PNG, using the same fonts, images and layout
+    /// the live window is drawing from.
+    ///
+    /// The window is rendered exactly as [`take_screenshot`](Self::take_screenshot)
+    /// does — same compositor, same caches, so the result is what the user
+    /// sees — and the node's box is then cut out of it. That keeps clipping,
+    /// overlap and effects from ancestors correct: a node re-rendered in
+    /// isolation would show none of them.
+    ///
+    /// The problem-report dialog uses this to show the user the exact image
+    /// it is about to attach.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description when the DOM has no layout, the node has no
+    /// bounds, or encoding fails.
+    #[cfg(all(feature = "std", feature = "cpurender"))]
+    pub fn take_screenshot_of_node(&self, node_id: DomNodeId) -> Result<Vec<u8>, AzString> {
+        let full = self.take_screenshot(node_id.dom)?;
+        let Some(position) = self.get_node_position(node_id) else {
+            return Err(AzString::from("node has no position in the current layout"));
+        };
+        let Some(size) = self.get_node_size(node_id) else {
+            return Err(AzString::from("node has no size in the current layout"));
+        };
+        // The screenshot is in PHYSICAL pixels; node bounds are logical.
+        let dpi = self.get_current_window_state().size.get_hidpi_factor().inner.get();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (x, y) = (
+            (position.x * dpi).max(0.0) as u32,
+            (position.y * dpi).max(0.0) as u32,
+        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (w, h) = (
+            (size.width * dpi).max(0.0) as u32,
+            (size.height * dpi).max(0.0) as u32,
+        );
+        crate::dialogs::report::crop_png(&full, x, y, w, h).map_err(AzString::from)
     }
 
     /// Take a screenshot and save it directly to a file

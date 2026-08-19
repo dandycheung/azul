@@ -6143,6 +6143,44 @@
                         ],
                         "repr": "C"
                     },
+                    "HttpMethod": {
+                        "doc": [
+                            "HTTP verb for HttpRequestConfig::http_request."
+                        ],
+                        "external": "azul_layout::http::HttpMethod",
+                        "custom_impls": [
+                            "Display"
+                        ],
+                        "derive": [
+                            "Debug",
+                            "Copy",
+                            "Clone",
+                            "PartialEq",
+                            "Eq",
+                            "Hash"
+                        ],
+                        "enum_fields": [
+                            {
+                                "Get": {}
+                            },
+                            {
+                                "Head": {}
+                            },
+                            {
+                                "Post": {}
+                            },
+                            {
+                                "Put": {}
+                            },
+                            {
+                                "Patch": {}
+                            },
+                            {
+                                "Delete": {}
+                            }
+                        ],
+                        "repr": "C"
+                    },
                     "HttpResponse": {
                         "external": "azul_layout::http::HttpResponse",
                         "derive": [
@@ -6457,6 +6495,57 @@
                                     "type": "bool"
                                 },
                                 "fn_body": "azul_layout::http::HttpRequestConfig::is_url_reachable(url)"
+                            },
+                            "http_request": {
+                                "doc": [
+                                    "HTTP request with an arbitrary verb and optional body, using this",
+                                    "configuration. An empty body sends no body (GET/HEAD semantics);",
+                                    "content_type only applies when a body is present."
+                                ],
+                                "fn_args": [
+                                    {
+                                        "self": "ref"
+                                    },
+                                    {
+                                        "method": "HttpMethod"
+                                    },
+                                    {
+                                        "url": "String"
+                                    },
+                                    {
+                                        "body": "U8Vec"
+                                    },
+                                    {
+                                        "content_type": "String"
+                                    }
+                                ],
+                                "returns": {
+                                    "type": "ResultHttpResponseHttpError"
+                                },
+                                "fn_body": "object.http_request(method, url, body, content_type)"
+                            },
+                            "http_post": {
+                                "doc": [
+                                    "HTTP POST with a body, using this configuration."
+                                ],
+                                "fn_args": [
+                                    {
+                                        "self": "ref"
+                                    },
+                                    {
+                                        "url": "String"
+                                    },
+                                    {
+                                        "body": "U8Vec"
+                                    },
+                                    {
+                                        "content_type": "String"
+                                    }
+                                ],
+                                "returns": {
+                                    "type": "ResultHttpResponseHttpError"
+                                },
+                                "fn_body": "object.http_post(url, body, content_type)"
                             }
                         },
                         "repr": "C"
@@ -6943,6 +7032,32 @@
                             {
                                 "Ok": {},
                                 "Cancel": {}
+                            }
+                        ],
+                        "repr": "C"
+                    },
+                    "SysDialogType": {
+                        "doc": [
+                            "A built-in system dialog the engine presents on the app's behalf",
+                            "(always CPU-rendered)."
+                        ],
+                        "external": "azul_core::window::SysDialogType",
+                        "derive": [
+                            "Debug",
+                            "Clone",
+                            "Copy",
+                            "Eq",
+                            "PartialEq",
+                            "Ord",
+                            "Hash",
+                            "PartialOrd"
+                        ],
+                        "enum_fields": [
+                            {
+                                "ReportProblem": {},
+                                "UpdateVersion": {},
+                                "TelemetryConsent": {},
+                                "GpuCheck": {}
                             }
                         ],
                         "repr": "C"
@@ -10490,6 +10605,34 @@
                                 },
                                 "fn_body": "object.take_screenshot(dom_id).into()"
                             },
+                            "take_screenshot_of_node": {
+                                "doc": [
+                                    "Take a CPU-rendered screenshot of ONE NODE.",
+                                    "",
+                                    "The window is rendered exactly as take_screenshot does - same",
+                                    "compositor, same font/image caches, so the result is what the",
+                                    "user sees - and the node's box is then cut out of it. Clipping,",
+                                    "overlap and ancestor effects therefore stay correct; a node",
+                                    "re-rendered in isolation would show none of them.",
+                                    "",
+                                    "# Returns",
+                                    "* Ok(Vec<u8>) - PNG-encoded image of the node",
+                                    "* Err(String) - the DOM has no layout, the node has no bounds,",
+                                    "  or encoding failed"
+                                ],
+                                "fn_args": [
+                                    {
+                                        "self": "ref"
+                                    },
+                                    {
+                                        "node_id": "DomNodeId"
+                                    }
+                                ],
+                                "returns": {
+                                    "type": "ResultU8VecString"
+                                },
+                                "fn_body": "object.take_screenshot_of_node(node_id).into()"
+                            },
                             "take_screenshot_to_file": {
                                 "doc": [
                                     "Take a CPU-rendered screenshot and save it to a file",
@@ -12513,6 +12656,114 @@
                                     }
                                 ],
                                 "fn_body": "object.set_animation_momentum(node_id, velocity)"
+                            },
+                            "invoke_system_dialog": {
+                                "doc": [
+                                    "Opens one of the built-in system dialogs (always CPU-rendered):",
+                                    "ReportProblem captures a screenshot of this window and opens the",
+                                    "problem-report dialog; UpdateVersion opens the update dialog and",
+                                    "starts the async manifest check (install only after consent)."
+                                ],
+                                "fn_args": [
+                                    {
+                                        "self": "refmut"
+                                    },
+                                    {
+                                        "dialog": "SysDialogType"
+                                    }
+                                ],
+                                "fn_body": "object.invoke_system_dialog(dialog)"
+                            },
+                            "check_for_updates": {
+                                "doc": [
+                                    "Checks for updates asynchronously on a background thread, reading",
+                                    "AppConfig.updates (manifest URL, current version, mode). The",
+                                    "callback runs on the main thread with the result; package-managed",
+                                    "installs are clamped to notify-only. Returns the thread's id."
+                                ],
+                                "fn_args": [
+                                    {
+                                        "self": "refmut"
+                                    },
+                                    {
+                                        "data": "RefAny"
+                                    },
+                                    {
+                                        "callback": "UpdateCheckCallback"
+                                    },
+                                    {
+                                        "options": "UpdateOptions"
+                                    }
+                                ],
+                                "returns": {
+                                    "type": "ThreadId"
+                                },
+                                "fn_body": "object.check_for_updates(data, callback, options)"
+                            },
+                            "record_counter": {
+                                "doc": [
+                                    "Records an app-defined COUNTER metric with free-form labels (pass an",
+                                    "empty vec for none). Labels are sanitized and capped (6 keys, 64-char",
+                                    "values); every distinct combination counts against the global series",
+                                    "ceiling. No-op unless telemetry is compiled in and consented to."
+                                ],
+                                "fn_args": [
+                                    {
+                                        "self": "refmut"
+                                    },
+                                    {
+                                        "name": "String"
+                                    },
+                                    {
+                                        "value": "u64"
+                                    },
+                                    {
+                                        "labels": "StringPairVec"
+                                    }
+                                ],
+                                "fn_body": "object.record_counter(name, value, labels)"
+                            },
+                            "record_histogram": {
+                                "doc": [
+                                    "Records an app-defined HISTOGRAM observation with free-form labels",
+                                    "(same sanitization and caps as record_counter)."
+                                ],
+                                "fn_args": [
+                                    {
+                                        "self": "refmut"
+                                    },
+                                    {
+                                        "name": "String"
+                                    },
+                                    {
+                                        "value": "f64"
+                                    },
+                                    {
+                                        "labels": "StringPairVec"
+                                    }
+                                ],
+                                "fn_body": "object.record_histogram(name, value, labels)"
+                            },
+                            "record_gauge": {
+                                "doc": [
+                                    "Sets an app-defined GAUGE with free-form labels (same sanitization",
+                                    "and caps as record_counter)."
+                                ],
+                                "fn_args": [
+                                    {
+                                        "self": "refmut"
+                                    },
+                                    {
+                                        "name": "String"
+                                    },
+                                    {
+                                        "value": "f64"
+                                    },
+                                    {
+                                        "labels": "StringPairVec"
+                                    }
+                                ],
+                                "fn_body": "object.record_gauge(name, value, labels)"
                             }
                         },
                         "repr": "C"
@@ -14729,6 +14980,177 @@
                                 "type": "LogicalRect"
                             }
                         }
+                    },
+                    "UpdateCheckCallbackType": {
+                        "external": "azul_layout::updater::UpdateCheckCallbackType",
+                        "callback_typedef": {
+                            "fn_args": [
+                                {
+                                    "type": "RefAny"
+                                },
+                                {
+                                    "type": "CallbackInfo"
+                                },
+                                {
+                                    "type": "UpdateCheckInfo"
+                                }
+                            ],
+                            "returns": {
+                                "type": "Update"
+                            }
+                        }
+                    },
+                    "UpdateMode": {
+                        "external": "azul_core::resources::UpdateMode",
+                        "derive": [
+                            "Default",
+                            "Clone",
+                            "Copy",
+                            "Debug",
+                            "Eq",
+                            "Hash",
+                            "Ord",
+                            "PartialEq",
+                            "PartialOrd"
+                        ],
+                        "enum_fields": [
+                            {
+                                "SelfUpdate": {},
+                                "NotifyOnly": {},
+                                "Disabled": {}
+                            }
+                        ],
+                        "repr": "C"
+                    },
+                    "UpdateSettings": {
+                        "doc": [
+                            "Update configuration (part of AppConfig): manifest URL, requested",
+                            "mode, the running version, and the state-directory app name."
+                        ],
+                        "external": "azul_core::resources::UpdateSettings",
+                        "custom_impls": [
+                            "Default"
+                        ],
+                        "derive": [
+                            "Debug",
+                            "Clone",
+                            "Eq",
+                            "PartialEq",
+                            "Ord",
+                            "Hash",
+                            "PartialOrd"
+                        ],
+                        "struct_fields": [
+                            {
+                                "mode": {
+                                    "type": "UpdateMode"
+                                },
+                                "manifest_url": {
+                                    "type": "OptionString"
+                                },
+                                "current_version": {
+                                    "type": "String"
+                                },
+                                "app_name": {
+                                    "type": "String"
+                                },
+                                "build_date": {
+                                    "type": "String"
+                                },
+                                "build_tag": {
+                                    "type": "String"
+                                },
+                                "channel": {
+                                    "type": "String",
+                                    "doc": [
+                                        "The release channel this binary follows: stable (the default when empty), beta, nightly, or whatever the publisher names. Compiled in, so a manifest cannot move a nightly build onto the stable track."
+                                    ]
+                                },
+                                "root_public_key": {
+                                    "type": "String",
+                                    "doc": [
+                                        "Base64 minisign ROOT public key compiled in by the app. Non-empty arms the update signature chain (root-signed signing-key statement + artifact signature required); empty = digest verification only."
+                                    ]
+                                }
+                            }
+                        ],
+                        "repr": "C"
+                    },
+                    "UpdateOptions": {
+                        "doc": [
+                            "Options for one update check. `download_automatically` STAGES the",
+                            "artifact in the background; installing still requires consent."
+                        ],
+                        "external": "azul_layout::updater::UpdateOptions",
+                        "derive": [
+                            "Debug",
+                            "Clone",
+                            "Copy",
+                            "Eq",
+                            "PartialEq",
+                            "Default"
+                        ],
+                        "struct_fields": [
+                            {
+                                "download_automatically": {
+                                    "type": "bool"
+                                }
+                            }
+                        ],
+                        "repr": "C"
+                    },
+                    "UpdateCheckInfo": {
+                        "doc": [
+                            "Everything one completed update check knows, delivered to the",
+                            "app's UpdateCheckCallback on the main thread."
+                        ],
+                        "external": "azul_layout::updater::UpdateCheckInfo",
+                        "derive": [
+                            "Debug",
+                            "Clone",
+                            "PartialEq"
+                        ],
+                        "struct_fields": [
+                            {
+                                "result": {
+                                    "type": "UpdateCheckResult"
+                                },
+                                "effective_mode": {
+                                    "type": "UpdateMode"
+                                },
+                                "install": {
+                                    "type": "InstallKind"
+                                },
+                                "staged_path": {
+                                    "type": "OptionString"
+                                }
+                            }
+                        ],
+                        "repr": "C"
+                    },
+                    "UpdateCheckResult": {
+                        "doc": [
+                            "What an update check concluded."
+                        ],
+                        "external": "azul_layout::updater::UpdateCheckResult",
+                        "derive": [
+                            "Debug",
+                            "Clone",
+                            "Eq",
+                            "PartialEq"
+                        ],
+                        "enum_fields": [
+                            {
+                                "UpToDate": {},
+                                "Available": {
+                                    "type": "ReleaseInfo"
+                                },
+                                "Error": {
+                                    "type": "String"
+                                }
+                            }
+                        ],
+                        "repr": "C, u8"
                     }
                 }
             },
@@ -24266,6 +24688,30 @@
                             {
                                 "cb": {
                                     "type": "usize"
+                                }
+                            }
+                        ],
+                        "repr": "C"
+                    },
+                    "UpdateCheckCallback": {
+                        "external": "azul_layout::updater::UpdateCheckCallback",
+                        "custom_impls": [
+                            "Clone",
+                            "Debug",
+                            "Eq",
+                            "From",
+                            "Hash",
+                            "Ord",
+                            "PartialEq",
+                            "PartialOrd"
+                        ],
+                        "struct_fields": [
+                            {
+                                "cb": {
+                                    "type": "UpdateCheckCallbackType"
+                                },
+                                "ctx": {
+                                    "type": "OptionRefAny"
                                 }
                             }
                         ],
@@ -71058,6 +71504,39 @@
                             }
                         ],
                         "repr": "C"
+                    },
+                    "EmailAddress": {
+                        "doc": [
+                            "An email address, e.g. a support mailbox problem reports go to."
+                        ],
+                        "external": "azul_core::resources::EmailAddress",
+                        "derive": [
+                            "Debug",
+                            "Clone",
+                            "Eq",
+                            "PartialEq",
+                            "Ord",
+                            "Hash",
+                            "PartialOrd"
+                        ],
+                        "struct_fields": [
+                            {
+                                "address": {
+                                    "type": "String"
+                                }
+                            }
+                        ],
+                        "constructors": {
+                            "new": {
+                                "fn_args": [
+                                    {
+                                        "address": "String"
+                                    }
+                                ],
+                                "fn_body": "azul_core::resources::EmailAddress::new(address)"
+                            }
+                        },
+                        "repr": "C"
                     }
                 }
             },
@@ -102518,6 +102997,27 @@
                             }
                         ],
                         "repr": "C, u8"
+                    },
+                    "OptionEmailAddress": {
+                        "external": "azul_core::resources::OptionEmailAddress",
+                        "derive": [
+                            "Debug",
+                            "Clone",
+                            "Eq",
+                            "PartialEq",
+                            "Ord",
+                            "Hash",
+                            "PartialOrd"
+                        ],
+                        "enum_fields": [
+                            {
+                                "None": {},
+                                "Some": {
+                                    "type": "EmailAddress"
+                                }
+                            }
+                        ],
+                        "repr": "C, u8"
                     }
                 }
             },
@@ -105148,6 +105648,15 @@
                                 },
                                 "custom_e2e_op": {
                                     "type": "CustomE2eOpCallback"
+                                },
+                                "updates": {
+                                    "type": "UpdateSettings"
+                                },
+                                "changelog_md": {
+                                    "type": "OptionString"
+                                },
+                                "report_problem": {
+                                    "type": "OptionEmailAddress"
                                 }
                             }
                         ],
@@ -110484,6 +110993,91 @@
                                 "fn_body": "object.page_of_y(y)"
                             }
                         },
+                        "repr": "C"
+                    },
+                    "InstallKind": {
+                        "doc": [
+                            "What kind of installation the running binary is - decides whether",
+                            "self-update is even on the table."
+                        ],
+                        "external": "azul_layout::updater::InstallKind",
+                        "derive": [
+                            "Debug",
+                            "Clone",
+                            "Copy",
+                            "Eq",
+                            "PartialEq"
+                        ],
+                        "enum_fields": [
+                            {
+                                "SystemPackageManager": {},
+                                "Snap": {},
+                                "Flatpak": {},
+                                "WindowsStore": {},
+                                "UserWritable": {},
+                                "ReadOnly": {}
+                            }
+                        ],
+                        "repr": "C"
+                    },
+                    "ReleaseInfo": {
+                        "doc": [
+                            "One release, as the update manifest describes it."
+                        ],
+                        "external": "azul_layout::updater::ReleaseInfo",
+                        "derive": [
+                            "Debug",
+                            "Clone",
+                            "Eq",
+                            "PartialEq",
+                            "Default"
+                        ],
+                        "struct_fields": [
+                            {
+                                "version": {
+                                    "type": "String"
+                                },
+                                "download_url": {
+                                    "type": "String"
+                                },
+                                "changelog_md_url": {
+                                    "type": "String"
+                                },
+                                "changelog_md_inline": {
+                                    "type": "String",
+                                    "doc": [
+                                        "The changelog Markdown itself, when the source carried it inline (a GitHub release body does). Preferred over fetching changelog_md_url."
+                                    ]
+                                },
+                                "digest": {
+                                    "type": "String"
+                                },
+                                "signature": {
+                                    "type": "String",
+                                    "doc": [
+                                        "Minisign signature of the artifact by the release-signing key (full .minisig text); required whenever the app pins a root_public_key."
+                                    ]
+                                },
+                                "signing_key_statement": {
+                                    "type": "String",
+                                    "doc": [
+                                        "Root-delegated signing-key statement: azul-signing-key-v1|pubkey=..|expires=..|generation=.."
+                                    ]
+                                },
+                                "signing_key_statement_sig": {
+                                    "type": "String",
+                                    "doc": [
+                                        "Minisign signature of the statement string by the ROOT key (full .minisig text)."
+                                    ]
+                                },
+                                "download_headers": {
+                                    "type": "StringPairVec",
+                                    "doc": [
+                                        "Headers the download needs when the artifact is not on open HTTP - an OCI registry blob wants the same bearer token the manifest request used. Empty for ordinary downloads."
+                                    ]
+                                }
+                            }
+                        ],
                         "repr": "C"
                     }
                 }

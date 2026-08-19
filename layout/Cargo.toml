@@ -96,11 +96,12 @@ zip = { version = "2.1", default-features = false, features = ["deflate"], optio
 material-icons = { version = "0.3", optional = true }
 
 # HTTP client for downloading language packs
-# HTTP client — uses pure-Rust TLS (no ring/aws-lc-rs C code)
-ureq = { version = "3.3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"], optional = true }
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"], optional = true }
-rustls-rustcrypto = { version = "0.0.2-alpha", optional = true }
-webpki-roots = { version = "1.0", optional = true }
+# HTTP client — uses pure-Rust TLS (no ring/aws-lc-rs C code).
+# Declared ONLY for non-wasm targets: rustls does not build on
+# wasm32-unknown-unknown (no UnixTime::now), and a browser cannot open raw
+# sockets anyway. The `http` feature stays ON there — `dep:` activation of a
+# target-filtered optional dep is a no-op on wasm, and src/http.rs routes the
+# whole public API to its loud error stubs.
 
 
 # JSON parsing.
@@ -109,6 +110,15 @@ webpki-roots = { version = "1.0", optional = true }
 # valid literals near f64::MAX outright ("number out of range"), so
 # `json_parse(json_stringify(x)) != x`. See core/Cargo.toml.
 serde_json = { version = "1.0", default-features = false, features = ["std", "float_roundtrip"], optional = true }
+# Crash-report MAIL transport (EHLO SMTP client). NOT on crates.io yet — a
+# git dependency is acceptable for this draft, but the crate must be
+# published (or path-vendored) before `crash-mail` can ship in a release:
+# the publish-safety gate rejects git deps.
+micromail = { version = "0.1.0", optional = true, default-features = false }
+# Digest verification of update downloads (already in the tree transitively).
+sha2 = { version = "0.10", optional = true }
+# Minisign SIGNATURE verification for update artifacts (pure Rust, zero deps).
+minisign-verify = { version = "0.2", optional = true }
 
 # SPMC channel — ONLY used by the e2e-server HTTP transport (feature
 # `e2e-server-http`). The core op-dispatch does not need it.
@@ -298,6 +308,36 @@ zip = ["dep:zip", "std"]
 # JSON parsing support
 json = ["dep:serde_json", "std", "azul-core/serde-json"]
 
+# Opt-in telemetry client: consent tiers, an in-process metric registry, an
+# OTLP/HTTP JSON encoder, a disk-backed ping queue and an uploader.
+#
+# JSON encode/decode rides `serde_json` (the same optional dependency the
+# `json` feature uses; USER ruling 2026-08-18 — no hand-rolled JSON), pulled
+# in only when this feature is on. It does need `http` for the uploader's
+# POST.
+#
+# Deliberately NOT in `default`: shipping an app that *can* phone home should
+# be a decision the developer makes explicitly. Even with the feature on,
+# collection stays off at runtime until a consent tier is configured — the
+# tier is a runtime atomic (AZ_TELEMETRY + the layered config files), never a
+# compile-time switch, so a consent toggle can flip it inside a running
+# process.
+# telemetry implies probe: the RSS/span instruments read through the probe,
+# and a metrics build that silently reports 0 RSS violates "a zero is not a
+# measurement".
+telemetry = ["std", "http", "dep:serde_json", "probe"]
+
+# Crash reports by EMAIL — the backup for deployments with no collector:
+# telemetry tier `crashes` (metrics off), no Grafana/Loki, just a support
+# mailbox that receives the crash dump as an attachment plus the user's
+# message. Manual send from the app's next-launch dialog, never automatic.
+crash-mail = ["telemetry", "dep:micromail"]
+
+# Version checks + update policy (Phase 4). Notify-first: managed installs
+# (dpkg, /usr, snap, flatpak, WindowsApps) are CLAMPED to notify-only at
+# runtime — the system package manager owns those updates.
+updater = ["std", "http", "dep:serde_json", "dep:sha2", "dep:minisign-verify"]
+
 # Icon provider support (material icons, icon packs from fonts or ZIP files)
 icons = ["std", "zip", "dep:material-icons", "dep:brotli-decompressor"]
 
@@ -326,6 +366,19 @@ e2e-server-http = ["e2e-server", "dep:spmc"]
 DISABLED_event_tests = []
 DISABLED_hint_vs_freetype = []
 DISABLED_selection_tests = []
+
+# Live telemetry demo (see examples/telemetry-grafana/ for the Grafana stack).
+# `required-features` keeps `cargo test --all-targets` on a default build from
+# trying to compile it; add `probe` for the RSS + per-phase panels.
+[[example]]
+name = "verify_update_manifest"
+path = "examples/verify_update_manifest.rs"
+required-features = ["updater"]
+
+[[example]]
+name = "telemetry_grafana"
+path = "examples/telemetry_grafana.rs"
+required-features = ["telemetry"]
 
 [[test]]
 name = "solver3_calc"
@@ -382,7 +435,15 @@ required-features = ["e2e-server"]
 # Dev-only: JSON fixture deserialization for the e2e_json harness. Dev-deps are
 # never shipped and never affect the published dependency graph, so this does
 # NOT rely on the optional `json` crate feature.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { version = "3.3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"], optional = true }
+rustls-rustcrypto = { version = "0.0.2-alpha", optional = true }
+webpki-roots = { version = "1.0", optional = true }
+
 [dev-dependencies]
+# Signing side of minisign — TESTS ONLY, to mint real signature vectors.
+minisign = "0.9"
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 
 [[bench]]

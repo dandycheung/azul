@@ -228,6 +228,10 @@ pub fn regenerate_layout(
     relayout_reason: azul_core::callbacks::RelayoutReason,
 ) -> Result<LayoutRegenerateResult, String> {
     log_debug!(LogCategory::Layout, "[regenerate_layout] START");
+    // Engine observability: the whole produce side (callback + solve + DL)
+    // reports as scope "layout"; the probe spans inside land per-phase.
+    #[cfg(feature = "telemetry")]
+    let _frame_pump = azul_layout::telemetry::FramePump::begin("layout");
     azul_layout::probe::emit_phase_heap("start");
     let mut phases = PhaseTimer::new();
 
@@ -333,8 +337,14 @@ phases.mark("before_callback");
     // the drain below must see ONLY what this invocation queried.
     let _ = azul_core::callbacks::take_recorded_size_queries();
 
+    // The layout callback IS app code (DOM construction): give it a
+    // cb:<name> span so "app builds the DOM" separates from engine solving.
+    let _cb_span = azul_layout::probe::Probe::span_for_fn(
+        current_window_state.layout_callback.cb as usize,
+    );
     let user_dom =
         (current_window_state.layout_callback.cb)((*app_data_borrowed).clone(), callback_info);
+    drop(_cb_span);
 
     drop(app_data_borrowed); // Release borrow
 

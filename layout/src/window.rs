@@ -3909,8 +3909,8 @@ impl LayoutWindow {
                 let (rss, _virt) = crate::probe::current_rss_bytes();
                 let peak = crate::probe::peak_rss_bytes_pub();
                 eprintln!("[MEM] after layout: current rss={:.1} MiB  peak rss={:.1} MiB  (unreturned={:.1} MiB)",
-                    rss as f64 / 1048576.0, peak as f64 / 1048576.0,
-                    (peak.saturating_sub(rss)) as f64 / 1048576.0);
+                    rss as f64 / 1_048_576.0, peak as f64 / 1_048_576.0,
+                    (peak.saturating_sub(rss)) as f64 / 1_048_576.0);
                 // `grand_total` is the layout_cache walk ONLY. `layout_results`
                 // holds a second StyledDom + LayoutTree and is measured later
                 // in the frame (see the walk at the insert site), so the best
@@ -3918,12 +3918,12 @@ impl LayoutWindow {
                 // bare ratio would repeat the exact error this pair of numbers
                 // exists to expose: an "accounted" line that silently omits a
                 // known owner reads as coverage it does not have.
-                let lr = LAST_LAYOUT_RESULTS_BYTES.load(Ordering::Relaxed);
+                let lr = LAST_LAYOUT_RESULTS_BYTES.load(Relaxed);
                 eprintln!("[MEM] accounted / rss = {:.1}% (layout_cache walk only) — the gap is allocator overhead + unreturned transient pages + fonts/images + misc",
                     grand_total as f64 * 100.0 / (rss as f64).max(1.0));
                 if lr > 0 {
                     eprintln!("[MEM]   incl. layout_results ({:.1} MiB, previous frame) = {:.1}%",
-                        lr as f64 / 1048576.0,
+                        lr as f64 / 1_048_576.0,
                         (grand_total as u64 + lr) as f64 * 100.0 / (rss as f64).max(1.0));
                 } else {
                     eprintln!("[MEM]   layout_results not yet measured this run — the ratio above is a FLOOR.");
@@ -9366,6 +9366,11 @@ impl LayoutWindow {
     ) -> (Vec<crate::callbacks::CallbackChange>, Update) {
         use crate::callbacks::{CallbackInfo, CallbackChange};
 
+        // Dispatch span: until this existed, all 118 probe spans lived in
+        // layout/font/render, so "is the *app's own* code slow" — a timer
+        // callback doing work on the UI thread — was uninstrumented.
+        let _timer_span = crate::probe::Probe::span("dispatch.timer");
+
         let mut update = Update::DoNothing;
         let mut all_changes = Vec::new();
         let mut should_terminate = TerminateTimer::Continue;
@@ -9461,6 +9466,10 @@ impl LayoutWindow {
             thread::{OptionThreadReceiveMsg, ThreadReceiveMsg, ThreadWriteBackMsg},
         };
 
+        // Dispatch span, sibling of `dispatch.timer`: covers the writeback
+        // callbacks worker threads run on the UI thread once per frame.
+        let _thread_span = crate::probe::Probe::span("dispatch.threads");
+
         let mut update = Update::DoNothing;
         let mut all_changes = Vec::new();
 
@@ -9469,10 +9478,6 @@ impl LayoutWindow {
         let thread_ids: Vec<ThreadId> = self.threads.keys().copied().collect();
 
         for thread_id in thread_ids {
-            let Some(thread) = self.threads.get_mut(&thread_id) else {
-                continue;
-            };
-
             let hit_dom_node = DomNodeId {
                 dom: DomId::ROOT_ID,
                 node: NodeHierarchyItemId::from_crate_internal(None),
@@ -9480,24 +9485,48 @@ impl LayoutWindow {
             let cursor_relative_to_item = OptionLogicalPosition::None;
             let cursor_in_viewport = OptionLogicalPosition::None;
 
+            // DRAIN the queue, don't sip it. The old code read ONE message
+            // per frame and then removed the thread if the worker had
+            // finished — so a worker that reports progress (several
+            // writebacks, then its result) had everything after the first
+            // message thrown away with the thread. Now: read until the queue
+            // is empty, and only retire a finished thread once it is.
+            let mut ticked = false;
+            loop {
             let (msg, writeback_data_ptr, is_finished) = {
+                // Re-acquired every iteration: the borrow must end before the
+                // body below, which needs `self` for CallbackInfoRefData.
+                let Some(thread) = self.threads.get_mut(&thread_id) else {
+                    break;
+                };
                 let thread_inner = &mut *if let Ok(s) = thread.ptr.lock() { s } else {
                     all_changes.push(CallbackChange::RemoveThread { thread_id });
-                    continue;
+                    break;
                 };
 
-                let _ = thread_inner.sender_send(ThreadSendMsg::Tick);
+                if !ticked {
+                    let _ = thread_inner.sender_send(ThreadSendMsg::Tick);
+                    ticked = true;
+                }
                 let recv = thread_inner.receiver_try_recv();
+                let is_finished = thread_inner.is_finished();
                 let msg = match recv {
-                    OptionThreadReceiveMsg::None => continue,
+                    // Queue empty: a finished worker has now delivered
+                    // everything it ever will, so it can be retired.
+                    OptionThreadReceiveMsg::None => {
+                        if is_finished {
+                            all_changes.push(CallbackChange::RemoveThread { thread_id });
+                        }
+                        break;
+                    }
                     OptionThreadReceiveMsg::Some(s) => s,
                 };
 
                 let writeback_data_ptr: *mut RefAny = &raw mut thread_inner.writeback_data;
-                let is_finished = thread_inner.is_finished();
 
                 (msg, writeback_data_ptr, is_finished)
             };
+            let _ = is_finished;
 
             let ThreadWriteBackMsg {
                 refany: mut data_inner,
@@ -9536,11 +9565,15 @@ impl LayoutWindow {
                 cursor_in_viewport,
             );
 
+            // "is the app's own code slow": writeback callbacks carry a
+            // cb:<name> span, same as timers and event callbacks.
+            let cb_span = crate::probe::Probe::span_for_fn(callback.cb as usize);
             let callback_update = (callback.cb)(
                 unsafe { (*writeback_data_ptr).clone() },
                 data_inner.clone(),
                 callback_info,
             );
+            drop(cb_span);
             update.max_self(callback_update);
 
             let collected_changes = callback_changes
@@ -9549,9 +9582,6 @@ impl LayoutWindow {
                 .unwrap_or_default();
 
             all_changes.extend(collected_changes);
-
-            if is_finished {
-                all_changes.push(CallbackChange::RemoveThread { thread_id });
             }
         }
 
@@ -9668,7 +9698,16 @@ impl LayoutWindow {
             cursor_in_viewport,
         );
 
+        // "is the app's own code slow": EVERY event callback runs inside a
+        // cb:<name> span (dladdr -> addr2line -> module-offset naming), so
+        // the callbacks sub-span panel shows real app code, not just timers.
+        // The same dispatch feeds the ACTION JOURNAL (off unless a report or
+        // crash path armed it) — the breadcrumb trail a problem report
+        // attaches as "recent actions".
+        crate::journal::record(hit_dom_node, callback.cb as usize);
+        let cb_span = crate::probe::Probe::span_for_fn(callback.cb as usize);
         let update = (callback.cb)(data.clone(), callback_info);
+        drop(cb_span);
 
         // Extract changes from the Arc<Mutex>
         let collected_changes = callback_changes
@@ -13782,6 +13821,105 @@ mod autotest_generated {
 
     fn fresh_window() -> LayoutWindow {
         LayoutWindow::new(FcFontCache::default()).expect("LayoutWindow::new must succeed")
+    }
+
+    // ---- thread writeback drain ------------------------------------------
+
+    /// Counts the writebacks that actually reached the main thread.
+    static DRAIN_DELIVERED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    struct DrainStep(usize);
+
+    /// A worker that reports PROGRESS: three messages, then it returns.
+    extern "C" fn multi_writeback_worker(
+        mut _init: RefAny,
+        mut sender: crate::thread::ThreadSender,
+        _recv: azul_core::task::ThreadReceiver,
+    ) {
+        for step in 0..3 {
+            let _ = sender.send(crate::thread::ThreadReceiveMsg::WriteBack(
+                crate::thread::ThreadWriteBackMsg::new(
+                    drain_writeback as crate::thread::WriteBackCallbackType,
+                    RefAny::new(DrainStep(step)),
+                ),
+            ));
+        }
+    }
+
+    extern "C" fn drain_writeback(
+        mut _state: RefAny,
+        mut msg: RefAny,
+        _info: crate::callbacks::CallbackInfo,
+    ) -> Update {
+        if msg.downcast_ref::<DrainStep>().is_some() {
+            DRAIN_DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Update::DoNothing
+    }
+
+    /// LAW: every writeback a worker sends reaches the main thread.
+    ///
+    /// `run_all_threads` used to read ONE message per frame and retire the
+    /// thread as soon as the worker had finished — so a worker that reports
+    /// progress (several writebacks, then its result) had everything after
+    /// the first message dropped on the floor with the thread. Anything
+    /// built on progress reporting (the graphics-check dialog's install
+    /// progress bar) would silently show one step and then freeze.
+    #[test]
+    fn every_writeback_a_worker_sends_reaches_the_main_thread() {
+        use azul_core::window::RawWindowHandle;
+
+        DRAIN_DELIVERED.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let mut win = fresh_window();
+        let thread_id = ThreadId::unique();
+        win.threads.insert(
+            thread_id,
+            crate::thread::Thread::create(
+                RefAny::new(()),
+                RefAny::new(()),
+                multi_writeback_worker as crate::thread::ThreadCallbackType,
+            ),
+        );
+
+        let mut data = RefAny::new(());
+        let handle = RawWindowHandle::Unsupported;
+        let gl = OptionGlContextPtr::None;
+        let style = Arc::new(azul_css::system::SystemStyle::default());
+        let sc = ExternalSystemCallbacks::rust_internal();
+        let prev = None;
+        let cur = FullWindowState::default();
+        let rr = RendererResources::default();
+
+        // Poll until the thread retires itself (or we run out of patience —
+        // a hang here is a failure, not a pass).
+        let mut retired = false;
+        for _ in 0..200 {
+            let (changes, _) = win.run_all_threads(
+                &mut data, &handle, &gl, style.clone(), &sc, &prev, &cur, &rr,
+            );
+            for change in &changes {
+                if matches!(
+                    change,
+                    crate::callbacks::CallbackChange::RemoveThread { .. }
+                ) {
+                    retired = true;
+                }
+            }
+            if retired {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        assert!(retired, "the finished worker must eventually be retired");
+        assert_eq!(
+            DRAIN_DELIVERED.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "all three writebacks must be delivered — a progress-reporting \
+             worker must not lose messages to thread retirement"
+        );
     }
 
     /// A `DomLayoutResult` carrying a real `StyledDom` but an *empty* layout

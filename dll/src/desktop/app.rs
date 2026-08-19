@@ -152,8 +152,108 @@ impl App {
         let font_registry = self.ptr.font_registry.clone();
         let undo_manager = self.ptr.undo_manager.clone();
 
+        // Publish the AppConfig snapshot the engine services read outside
+        // callbacks: the updater (manifest URL, version, mode) and the
+        // system dialogs (support mailbox, changelog URL).
+        azul_layout::appenv::set_app_env(azul_layout::appenv::AppEnv::from_config(&config));
+
+        // Arm the ACTION JOURNAL for apps that declared a problem-report
+        // mailbox: the breadcrumb trail has to be recorded BEFORE the
+        // problem, and an app that never collects reports pays nothing.
+        if !matches!(
+            config.report_problem,
+            azul_core::resources::OptionEmailAddress::None
+        ) {
+            azul_layout::journal::set_enabled(true);
+        }
+
+        // Hand the CPU dialogs the driver-provisioning entry points. They
+        // live in the dll (`video_codec::provision`) and the dialogs live
+        // BELOW it in azul-layout, so the dll publishes fn pointers rather
+        // than the type. `check` is inspection only; `remediate` is the
+        // consent-gated, pkexec-elevated repair.
+        azul_layout::appenv::set_gpu_provision_hooks(azul_layout::appenv::GpuProvisionHooks {
+            check: || {
+                let c = crate::unified::video_codec::provision::VideoStartupCheck::run();
+                azul_layout::appenv::GpuProvisionReport {
+                    hw_decode_ready: c.hw_decode_ready,
+                    boot_safe: c.boot_safe,
+                    can_remediate: c.can_remediate,
+                    needs_reboot: c.needs_reboot,
+                    summary: c.summary.as_str().to_string(),
+                    detail: c.detail.as_str().to_string(),
+                }
+            },
+            remediate: |on_step| {
+                let o = crate::unified::video_codec::provision::VideoStartupCheck::
+                    remediate_with_progress(on_step);
+                azul_layout::appenv::GpuProvisionOutcome {
+                    ok: o.ok,
+                    reboot_required: o.reboot_required,
+                    message: o.message.as_str().to_string(),
+                }
+            },
+        });
+
+        // ENGINE TELEMETRY (dll feature "telemetry"): initialised for every
+        // app, but the TIER stays OFF unless AZ_TELEMETRY / the config files
+        // opted in — with nothing opted in, none of this collects or sends.
+        // This is what lets any azul app (azwriter under an e2e run, say) be
+        // driven headlessly and report real frame durations + solver/raster
+        // spans, so a stutter can be drilled down to the phase that caused
+        // it.
+        #[cfg(feature = "telemetry")]
+        {
+            let channel = std::env::var("AZ_TELEMETRY_CHANNEL")
+                .unwrap_or_else(|_| "default".to_owned());
+            let _telemetry_config = azul_layout::telemetry::init(
+                config.updates.app_name.as_str(),
+                azul_layout::telemetry::AppMeta::new(
+                    config.updates.current_version.as_str(),
+                    channel,
+                ),
+            );
+            azul_layout::telemetry::install_panic_hook();
+            azul_layout::telemetry::record_session_start();
+            let _ = azul_layout::telemetry::spawn_uploader();
+        }
+
+        // CRASH-REPORTER TAKEOVER: a crashed sibling process (telemetry off,
+        // crash contact configured) re-spawned this executable with
+        // AZ_CRASH_DUMP=<dump.json>. This invocation IS the crash reporter:
+        // show the dump in a CPU-rendered dialog instead of running the app.
+        #[cfg(feature = "telemetry")]
+        if let Some(dump) = azul_layout::telemetry::crash_dump_from_env() {
+            crate::plog_info!(
+                "[azul] AZ_CRASH_DUMP set — running the crash-reporter dialog for {:?}",
+                dump.path
+            );
+            let dialog = azul_layout::dialogs::crash_reporter::window(dump);
+            let err = crate::desktop::shell2::run(
+                data,
+                undo_manager,
+                config,
+                fc_cache,
+                font_registry,
+                dialog,
+            );
+            if let Err(e) = err {
+                eprintln!("[azul] crash-reporter dialog failed: {e:?}");
+            }
+            return;
+        }
+
         // Use shell2 for the actual run loop
         let err = crate::desktop::shell2::run(data, undo_manager, config, fc_cache, font_registry, root_window);
+
+        // Telemetry: persist + upload whatever the interval uploader has not
+        // sent yet. Without this a SHORT run (an e2e drive, a screenshot
+        // harness) exits before the first flush tick and reports nothing.
+        #[cfg(feature = "telemetry")]
+        {
+            let _ = azul_layout::telemetry::drain_probe_events();
+            let _outcome = azul_layout::telemetry::flush();
+        }
 
         if let Err(e) = err {
             // ALWAYS surface the error — to the log facade AND raw stderr — on

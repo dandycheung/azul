@@ -44,6 +44,12 @@ mod imp {
         /// Currently-open span count. Read when a span OPENS (its own
         /// depth) and decremented when it closes.
         static DEPTH: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+        /// Names of the currently-open spans, outermost first. Maintained
+        /// UNCONDITIONALLY (even with recording off): this is what a crash
+        /// report reads as "what scope was the app in" — a diagnostic that
+        /// must not depend on AZ_PROFILE being set. Cost: one push/pop of a
+        /// `&'static str` per span.
+        static SPAN_NAMES: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     }
 
     /// Whether spans/samples are RECORDED. The `probe` feature being compiled
@@ -51,10 +57,10 @@ mod imp {
     /// unconditionally, and the event buffer is only drained by the
     /// `AZ_PROFILE=cpu` report path. Every plain run therefore pushed ~40 B
     /// per span into a thread-local Vec that nothing ever emptied: unbounded
-    /// growth, invisible to the LayoutCache memory walk (it's a thread-local).
+    /// growth, invisible to the `LayoutCache` memory walk (it's a thread-local).
     /// A 5 s resize drag alone is ~375 relayouts × hundreds of spans.
     ///
-    /// 0 = uninitialized (resolve from AZ_PROFILE on first probe),
+    /// 0 = uninitialized (resolve from `AZ_PROFILE` on first probe),
     /// 1 = recording, 2 = off.
     static RECORDING: AtomicU8 = AtomicU8::new(0);
 
@@ -84,6 +90,7 @@ mod imp {
     /// RAII guard that records its name + elapsed nanos on drop.
     /// `start == None` means recording was off when the span opened: the
     /// guard is inert (no clock read on open, no TLS touch on drop).
+    #[derive(Debug)]
     pub struct Span {
         pub(crate) name: &'static str,
         pub(crate) start: Option<Instant>,
@@ -92,6 +99,9 @@ mod imp {
 
     impl Drop for Span {
         fn drop(&mut self) {
+            let _ = SPAN_NAMES.try_with(|st| {
+                st.borrow_mut().pop();
+            });
             let Some(start) = self.start else { return };
             let dur_ns = start.elapsed().as_nanos() as u64;
             // try_with (not with): the lifted-to-wasm web backend has no real
@@ -111,6 +121,7 @@ mod imp {
     }
 
     pub(super) fn open(name: &'static str) -> Span {
+        let _ = SPAN_NAMES.try_with(|st| st.borrow_mut().push(name));
         if !recording() {
             return Span { name, start: None, depth: 0 };
         }
@@ -139,10 +150,164 @@ mod imp {
         });
     }
 
+    /// The path of currently-open spans on THIS thread, outermost first,
+    /// joined with `" > "` — e.g. `dispatch.timer > layout > text_shape`.
+    /// Empty when no span is open. Readable from a panic hook (same thread).
+    pub(super) fn span_path() -> String {
+        SPAN_NAMES
+            .try_with(|st| st.borrow().join(" > "))
+            .unwrap_or_default()
+    }
+
     pub(super) fn drain() -> Vec<super::Event> {
         EVENTS
             .try_with(|cell| core::mem::take(&mut *cell.borrow_mut()))
             .unwrap_or_default()
+    }
+
+    /// `dladdr`-backed pointer→symbol resolution with a leak-once cache.
+    /// Span names are `&'static str`, so each distinct callback leaks ONE
+    /// small string for the process lifetime — bounded by the number of
+    /// distinct callbacks an app has.
+    pub(super) fn resolve_fn_name(fn_ptr: usize) -> &'static str {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<HashMap<usize, &'static str>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(map) = cache.lock() {
+            if let Some(name) = map.get(&fn_ptr) {
+                return name;
+            }
+        }
+        let resolved: &'static str = {
+            #[cfg(unix)]
+            {
+                // dladdr resolves names from .dynsym only — a statically
+                // linked, non--rdynamic binary yields NO symbol for its own
+                // functions. Fallback ladder: (1) `addr2line` against the
+                // module's DEBUG symbols (Linux, when the tool is installed —
+                // this recovers the real name, e.g. `cb:demo_button_click`,
+                // even on static binaries); (2) the MODULE-RELATIVE offset
+                // (`cb:+0x<offset>`), stable across runs of the same binary
+                // (ASLR shifts the base, not the offset), so distinct
+                // callbacks stay distinguishable and comparable per version.
+                let mut info: libc::Dl_info = unsafe { core::mem::zeroed() };
+                let rc = unsafe { libc::dladdr(fn_ptr as *const libc::c_void, &raw mut info) };
+                if rc != 0 && !info.dli_sname.is_null() {
+                    let name = unsafe { core::ffi::CStr::from_ptr(info.dli_sname) };
+                    match name.to_str() {
+                        Ok(sym) if !sym.is_empty() => {
+                            Box::leak(format!("cb:{sym}").into_boxed_str())
+                        }
+                        _ => Box::leak(format!("cb:0x{fn_ptr:x}").into_boxed_str()),
+                    }
+                } else if rc != 0 && !info.dli_fbase.is_null() {
+                    let offset = fn_ptr.wrapping_sub(info.dli_fbase as usize);
+                    let module = if info.dli_fname.is_null() {
+                        None
+                    } else {
+                        unsafe { core::ffi::CStr::from_ptr(info.dli_fname) }
+                            .to_str()
+                            .ok()
+                            .map(str::to_owned)
+                    };
+                    match addr2line_name(module.as_deref(), offset, fn_ptr) {
+                        Some(sym) => Box::leak(format!("cb:{sym}").into_boxed_str()),
+                        None => Box::leak(format!("cb:+0x{offset:x}").into_boxed_str()),
+                    }
+                } else {
+                    // dladdr failed outright: the raw address still separates
+                    // one callback from another within this run.
+                    Box::leak(format!("cb:0x{fn_ptr:x}").into_boxed_str())
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                Box::leak(format!("cb:0x{fn_ptr:x}").into_boxed_str())
+            }
+        };
+        if let Ok(mut map) = cache.lock() {
+            map.insert(fn_ptr, resolved);
+        }
+        resolved
+    }
+
+    /// DEBUG-SYMBOL fallback: asks the system's `addr2line` for the function
+    /// name at `offset` inside `module` (Linux; other unixes rarely ship
+    /// it). Recovers real names on statically linked binaries whose own
+    /// functions are absent from `.dynsym` — exactly the case `dladdr`
+    /// cannot answer.
+    ///
+    /// Runs AT MOST ONCE per distinct callback pointer (the leak-once cache
+    /// above), so the subprocess cost — up to a few hundred ms the first
+    /// time addr2line loads a big binary's DWARF — is a one-time price per
+    /// callback, not per span. `AZ_PROBE_ADDR2LINE=0` disables it.
+    ///
+    /// PIE executables and shared objects map file offsets 1:1 to link-time
+    /// addresses, so the module-relative offset is the right query; for a
+    /// non-PIE main binary (fixed 0x400000 base) the RAW pointer is, so a
+    /// failed first query retries with it.
+    /// Probed ONCE per process (first resolution), then a flag test: systems
+    /// without addr2line never spawn a second lookup attempt, and nothing
+    /// here can fail loudly — "not available" just means the offset form.
+    #[cfg(unix)]
+    fn addr2line_available() -> bool {
+        use std::sync::OnceLock;
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            std::process::Command::new("addr2line")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+    }
+
+    #[cfg(unix)]
+    fn addr2line_name(module: Option<&str>, offset: usize, raw_ptr: usize) -> Option<String> {
+        if !cfg!(target_os = "linux") {
+            return None;
+        }
+        if std::env::var("AZ_PROBE_ADDR2LINE").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        if !addr2line_available() {
+            return None;
+        }
+        let module: std::borrow::Cow<'_, str> = match module {
+            Some(m) if !m.is_empty() => m.into(),
+            _ => std::env::current_exe().ok()?.to_string_lossy().into_owned().into(),
+        };
+        let ask = |addr: usize| -> Option<String> {
+            let out = std::process::Command::new("addr2line")
+                .arg("-f") // function names…
+                .arg("-C") // …demangled
+                .arg("-i") // …with the full INLINE stack: a tiny callback's
+                //            first instruction often belongs to an inlined
+                //            callee (black_box, a getter), and the innermost
+                //            frame would name THAT. The callback is the
+                //            OUTERMOST frame — the last name in the output.
+                .arg("-e")
+                .arg(module.as_ref())
+                .arg(format!("0x{addr:x}"))
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&out.stdout);
+            // Lines alternate name/location, innermost first; keep the last
+            // usable NAME line (the outermost frame).
+            let name = text
+                .lines()
+                .step_by(2)
+                .map(str::trim)
+                .filter(|n| !n.is_empty() && *n != "??")
+                .last()?;
+            Some(name.to_owned())
+        };
+        ask(offset).or_else(|| ask(raw_ptr))
     }
 
     pub(super) fn drop_events() {
@@ -153,7 +318,7 @@ mod imp {
         EVENTS.try_with(|cell| cell.borrow().len()).unwrap_or(0)
     }
 
-    pub(super) fn enabled() -> bool {
+    pub(super) const fn enabled() -> bool {
         true
     }
 }
@@ -175,6 +340,16 @@ mod imp {
     #[inline]
     pub(super) const fn open(_name: &'static str) -> Span {
         Span
+    }
+
+    #[inline]
+    pub(super) const fn span_path() -> String {
+        String::new()
+    }
+
+    #[inline]
+    pub(super) const fn resolve_fn_name(_fn_ptr: usize) -> &'static str {
+        "cb:?"
     }
 
     #[inline]
@@ -276,6 +451,40 @@ impl Probe {
     #[allow(clippy::missing_const_for_fn)]
     #[must_use] pub fn drain() -> Vec<Event> {
         imp::drain()
+    }
+
+    /// The names of THIS thread's currently-open spans, outermost first,
+    /// joined with `" > "` (empty when none). Maintained even with recording
+    /// off — a crash report reads this as "what scope was the app in", and
+    /// that diagnostic must not depend on `AZ_PROFILE`.
+    #[inline]
+    // const only in the no-`probe` stub config; enabled `imp::` calls are non-const
+    #[allow(clippy::missing_const_for_fn)]
+    #[must_use] pub fn span_path() -> String {
+        imp::span_path()
+    }
+
+    /// A timed span NAMED AFTER the function the pointer points at,
+    /// resolved through the dynamic linker (`dladdr`) and cached forever:
+    /// an `extern "C"` app callback like `my_button_click` becomes span
+    /// `cb:my_button_click`, so the per-phase histogram answers
+    /// "`my_button_click` takes 0.2 ms on 1.5.0, took 0.1 ms on 1.4.3".
+    ///
+    /// Resolution runs ONCE per distinct pointer (a leak-once cache bounded
+    /// by the number of distinct callbacks); every later call is one map
+    /// lookup. When the symbol is unresolvable (static non-`-rdynamic`
+    /// binaries keep their own functions out of `.dynsym`), the fallback
+    /// ladder is: `addr2line` against the module's debug symbols (Linux,
+    /// when installed — recovers the real name; `AZ_PROBE_ADDR2LINE=0`
+    /// disables), then the module-relative offset `cb:+0x<offset>` — stable
+    /// across runs of the same binary, so distinct callbacks remain
+    /// distinguishable and per-version comparisons still work; `cb:0x<addr>`
+    /// is the last resort when `dladdr` fails entirely.
+    #[inline]
+    // const only in the no-`probe` stub config; enabled `imp::` calls are non-const
+    #[allow(clippy::missing_const_for_fn)]
+    #[must_use] pub fn span_for_fn(fn_ptr: usize) -> Span {
+        imp::open(imp::resolve_fn_name(fn_ptr))
     }
 
     /// Discard the per-thread event buffer without allocating a `Vec` to
@@ -446,20 +655,26 @@ pub fn sample_peak_rss(label: &'static str) {
 }
 
 #[cfg(feature = "probe")]
-pub fn peak_rss_bytes_pub() -> u64 { peak_rss_bytes_self() }
+#[must_use] pub fn peak_rss_bytes_pub() -> u64 { peak_rss_bytes_self() }
 
 #[cfg(feature = "probe")]
 fn peak_rss_bytes_self() -> u64 {
     #[cfg(unix)]
     unsafe {
         let mut ru: libc::rusage = core::mem::zeroed();
-        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
+        if libc::getrusage(libc::RUSAGE_SELF, &raw mut ru) != 0 {
             return 0;
         }
         let raw = ru.ru_maxrss as u64;
         if cfg!(target_os = "macos") { raw } else { raw.saturating_mul(1024) }
     }
-    #[cfg(not(unix))]
+    // Windows has no getrusage; `PeakWorkingSetSize` is the direct equivalent
+    // of `ru_maxrss` and is already in bytes.
+    #[cfg(all(target_os = "windows", not(miri)))]
+    {
+        windows_memory_counters().map_or(0, |c| c.peak_working_set)
+    }
+    #[cfg(not(any(unix, all(target_os = "windows", not(miri)))))]
     {
         0
     }
@@ -541,7 +756,7 @@ pub fn hint_purge_allocator() {
 }
 
 /// Sample the process's "real" memory footprint (not peak).
-/// Returns (footprint_bytes, virtual_bytes). On macOS this is
+/// Returns (`footprint_bytes`, `virtual_bytes`). On macOS this is
 /// `phys_footprint` from `TASK_VM_INFO` — matches Activity Monitor
 /// "Memory" and `vmmap`'s "Physical footprint" line, and excludes
 /// shared library text pages that would otherwise inflate RSS
@@ -550,7 +765,7 @@ pub fn hint_purge_allocator() {
 /// equivalent; the shared-lib inflation is much smaller there).
 /// More useful than `getrusage.ru_maxrss` which only moves upward.
 #[cfg(feature = "probe")]
-pub fn current_rss_bytes() -> (u64, u64) {
+#[must_use] pub fn current_rss_bytes() -> (u64, u64) {
     // Miri cannot call the mach `task_info` foreign function; memory profiling
     // is meaningless under Miri anyway, so report zero.
     #[cfg(miri)]
@@ -617,8 +832,88 @@ pub fn current_rss_bytes() -> (u64, u64) {
             size.saturating_mul(page),
         )
     }
-    #[cfg(not(any(target_os = "macos", all(target_os = "linux", not(miri)))))]
+    // Windows: `K32GetProcessMemoryInfo` is the documented equivalent.
+    // WorkingSetSize is the RSS analogue (what Task Manager calls "Memory
+    // (active private working set)"'s superset), PrivateUsage is the commit
+    // charge — the closest thing to the "virtual" slot the other arms fill.
+    //
+    // Until this arm existed every Windows build reported (0, 0), which made
+    // "startup RSS after an update" — the one metric the telemetry rollout
+    // gate is built on — silently meaningless on the majority desktop
+    // platform (`core/src/profile.rs` documented this as a known hole).
+    #[cfg(all(target_os = "windows", not(miri)))]
+    {
+        windows_memory_counters().map_or((0, 0), |c| (c.working_set, c.private_usage))
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        all(target_os = "linux", not(miri)),
+        all(target_os = "windows", not(miri))
+    )))]
     { (0, 0) }
+}
+
+/// Snapshot of `PROCESS_MEMORY_COUNTERS_EX`, in bytes.
+#[cfg(all(feature = "probe", target_os = "windows", not(miri)))]
+pub(crate) struct WindowsMemoryCounters {
+    /// `WorkingSetSize` — resident bytes; the RSS analogue.
+    pub working_set: u64,
+    /// `PeakWorkingSetSize` — high-water mark of the above.
+    pub peak_working_set: u64,
+    /// `PrivateUsage` — commit charge (private bytes).
+    pub private_usage: u64,
+}
+
+/// Reads `PROCESS_MEMORY_COUNTERS_EX` for the current process.
+///
+/// `K32GetProcessMemoryInfo` lives directly in `kernel32.dll` (Windows 7+),
+/// so this needs no `psapi.dll` import library and no `windows-sys`
+/// dependency — matching how the macOS arm above hand-declares `task_info`.
+///
+/// Returns `None` if the call fails.
+#[cfg(all(feature = "probe", target_os = "windows", not(miri)))]
+pub(crate) fn windows_memory_counters() -> Option<WindowsMemoryCounters> {
+    // Layout per the Win32 header. On 64-bit the two leading DWORDs pack into
+    // the first 8 bytes with no tail padding before the first SIZE_T, so the
+    // struct maps 1:1; `cb` is validated by the callee against what we pass.
+    #[repr(C)]
+    struct ProcessMemoryCountersEx {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn K32GetProcessMemoryInfo(
+            process: *mut core::ffi::c_void,
+            counters: *mut ProcessMemoryCountersEx,
+            cb: u32,
+        ) -> i32;
+    }
+
+    unsafe {
+        let mut counters: ProcessMemoryCountersEx = core::mem::zeroed();
+        let cb = u32::try_from(core::mem::size_of::<ProcessMemoryCountersEx>()).ok()?;
+        counters.cb = cb;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, cb) == 0 {
+            return None;
+        }
+        Some(WindowsMemoryCounters {
+            working_set: counters.working_set_size as u64,
+            peak_working_set: counters.peak_working_set_size as u64,
+            private_usage: counters.private_usage as u64,
+        })
+    }
 }
 
 /// Heap bytes currently held by the libc allocator (`mstats.bytes_used`).
@@ -673,7 +968,7 @@ pub fn malloc_heap_bytes() -> u64 {
             // the constant for linux-gnu, so spell it out.
             let sym = libc::dlsym(
                 core::ptr::null_mut(),
-                b"mallinfo2\0".as_ptr().cast::<core::ffi::c_char>(),
+                c"mallinfo2".as_ptr(),
             );
             if sym.is_null() {
                 None
@@ -684,12 +979,12 @@ pub fn malloc_heap_bytes() -> u64 {
                 >(sym))
             }
         });
-        return match resolved {
+        match resolved {
             Some(mallinfo2) => unsafe { mallinfo2().uordblks as u64 },
             // Pre-2.33 glibc. `uordblks` is a signed int that wraps past
             // 2 GiB; clamp rather than report a negative byte count.
             None => unsafe { libc::mallinfo().uordblks.max(0) as u64 },
-        };
+        }
     }
     #[cfg(not(any(
         target_os = "macos",
@@ -704,13 +999,16 @@ pub fn malloc_heap_bytes() -> u64 {
 /// other kernel-mapped regions that inflate the traditional RSS
 /// number without actually costing the process anything. For a
 /// short-lived headless render this is a much more honest figure:
-/// on a ~20 MiB ru_maxrss run, phys_footprint is typically ~8 MiB.
+/// on a ~20 MiB `ru_maxrss` run, `phys_footprint` is typically ~8 MiB.
 /// Returns 0 on non-macOS or if the Mach call fails.
 ///
-/// There's no direct "peak phys_footprint" field; track the max
+/// There's no direct "peak `phys_footprint`" field; track the max
 /// across calls in application code if you need it.
 #[cfg(feature = "probe")]
-pub fn phys_footprint_bytes() -> u64 {
+// NOT const: the macOS branch calls mach task_info — const only held on
+// targets where that branch compiles out (E0015 on aarch64-apple-darwin).
+#[allow(clippy::missing_const_for_fn)]
+#[must_use] pub fn phys_footprint_bytes() -> u64 {
     // Miri cannot call the mach `task_info` foreign function.
     #[cfg(miri)]
     return 0;
@@ -768,11 +1066,11 @@ pub fn phys_footprint_bytes() -> u64 {
     { 0 }
 }
 
-/// Background sampler for peak phys_footprint. Spawns a thread that
+/// Background sampler for peak `phys_footprint`. Spawns a thread that
 /// polls `phys_footprint_bytes()` every ~2 ms and updates a shared
-/// atomic. The kernel does not expose a direct "peak phys_footprint"
-/// — unlike `resident_size_peak` in TASK_VM_INFO — so polling is
-/// the only way to catch mid-phase transients that are MADV_FREE'd
+/// atomic. The kernel does not expose a direct "peak `phys_footprint`"
+/// — unlike `resident_size_peak` in `TASK_VM_INFO` — so polling is
+/// the only way to catch mid-phase transients that are `MADV_FREE`'d
 /// before the next explicit sample point.
 ///
 /// Not started by default; call `start_peak_sampler()` once at
@@ -780,6 +1078,8 @@ pub fn phys_footprint_bytes() -> u64 {
 /// (~1-5 µs per poll on macOS, 500 Hz → <0.25% CPU of one core).
 /// `peak_phys_footprint_seen()` reads the current high-water mark.
 #[cfg(feature = "probe")]
+// NOT const: the macOS branch spawns the sampler thread (E0015 there).
+#[allow(clippy::missing_const_for_fn)]
 pub fn start_peak_sampler() {
     #[cfg(target_os = "macos")]
     {
@@ -815,7 +1115,7 @@ pub fn peak_phys_footprint_seen() -> u64 {
     PEAK_PHYS_FOOTPRINT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Reset the global peak high-water mark to the current phys_footprint.
+/// Reset the global peak high-water mark to the current `phys_footprint`.
 /// Paired with `peak_phys_footprint_seen()` so a caller can record
 /// "peak during phase X" — call `reset_peak()` at phase entry, then
 /// `peak_phys_footprint_seen()` at phase exit. The 500 Hz background
@@ -887,11 +1187,10 @@ pub fn emit_phase_heap(label: &str) {
         .append(true)
         .open(p)
     {
-        let _ = writeln!(
+        drop(writeln!(
             f,
-            r#"{{"ev":"phase","call":{},"label":"{}","heap":{}}}"#,
-            call_id, label, heap
-        );
+            r#"{{"ev":"phase","call":{call_id},"label":"{label}","heap":{heap}}}"#
+        ));
     }
 }
 
@@ -918,11 +1217,10 @@ pub fn emit_phase_heap_extra(label: &str, extra: u64) {
         .append(true)
         .open(p)
     {
-        let _ = writeln!(
+        drop(writeln!(
             f,
-            r#"{{"ev":"phase","call":0,"label":"{}","heap":{},"extra":{}}}"#,
-            label, heap, extra
-        );
+            r#"{{"ev":"phase","call":0,"label":"{label}","heap":{heap},"extra":{extra}}}"#
+        ));
     }
 }
 
@@ -944,7 +1242,7 @@ fn heap_jsonl_enabled() -> bool {
 /// without pulling in `azul_core::profile` directly.
 #[cfg(feature = "probe")]
 #[inline]
-pub fn detail_enabled() -> bool {
+#[must_use] pub fn detail_enabled() -> bool {
     azul_core::profile::detail_enabled()
 }
 
@@ -1423,11 +1721,28 @@ mod autotest_generated {
         sample_peak_rss("autotest_peak_rss");
         let events = Probe::drain();
         if Probe::enabled() {
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0].name, "autotest_peak_rss");
+            // `sample_peak_rss` deliberately wraps its /proc (or mach) read in
+            // a `probe_rss_sample_cost` span so the profiler's own cost shows
+            // up as a line in its own report. So the drain holds TWO events,
+            // and the assertion has to be about the labelled Rss sample, not
+            // about the buffer length — the old `events.len() == 1` could only
+            // ever pass on the `!Probe::enabled()` path, i.e. never with the
+            // `probe` feature actually on, which is the only configuration
+            // where this test tests anything.
+            let rss: Vec<&Event> = events
+                .iter()
+                .filter(|ev| ev.name == "autotest_peak_rss")
+                .collect();
+            assert_eq!(rss.len(), 1, "drained: {events:?}");
             assert!(
-                rss_bytes(&events[0]).is_some(),
+                rss_bytes(rss[0]).is_some(),
                 "sample_peak_rss must emit an Rss-kind event"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|ev| ev.name == "probe_rss_sample_cost"),
+                "the self-measurement span must still be recorded: {events:?}"
             );
         } else {
             assert!(events.is_empty());
@@ -2082,4 +2397,57 @@ mod allocator_stats_tests {
         // safe to assert here.
         drop(big);
     }
+
+    #[test]
+    #[cfg(feature = "probe")] // without the probe the const stub returns "cb:?" by design
+    fn fn_name_resolution_never_collapses_to_a_bare_question_mark() {
+        // The static-link fallback law: two DIFFERENT functions must get
+        // DIFFERENT span names even when dladdr cannot name them — "cb:?"
+        // for everything made the per-callback panels a single useless bar.
+        // #[inline(never)] + distinct bodies: release-mode ICF merges
+        // identical functions into ONE address, which is not what this
+        // test is about.
+        #[inline(never)]
+        fn f_one() -> u32 { std::hint::black_box(1) }
+        #[inline(never)]
+        fn f_two() -> u32 { std::hint::black_box(2) }
+        let a = Probe::span_for_fn(f_one as usize);
+        let b = Probe::span_for_fn(f_two as usize);
+        drop(a);
+        drop(b);
+        let names = super::imp::resolve_fn_name(f_one as usize);
+        let names2 = super::imp::resolve_fn_name(f_two as usize);
+        assert_ne!(names, "cb:?", "unresolved symbol must fall back to an address form");
+        assert_ne!(names, names2, "distinct fns must resolve to distinct span names");
+        assert!(
+            names.starts_with("cb:"),
+            "span name keeps the cb: family prefix: {names}"
+        );
+        // With addr2line installed (Linux), the DEBUG-symbol fallback must
+        // recover the REAL name — the test binary carries debuginfo.
+        if cfg!(target_os = "linux")
+            && std::process::Command::new("addr2line")
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        {
+            assert!(
+                names.contains("f_one"),
+                "addr2line fallback must name the function, got: {names}"
+            );
+        }
+    }
+}
+
+/// The resolved name of a callback function pointer — the same ladder the
+/// `cb:` spans use (`dladdr` → `addr2line` → module-relative offset →
+/// address). Cached; the returned string lives for the process.
+///
+/// The action journal names handlers with this, so a problem report reads
+/// `cb:on_save_clicked` rather than a bare pointer.
+// const only in the no-`probe` stub config; the enabled resolver is not const
+#[allow(clippy::missing_const_for_fn)]
+#[must_use]
+pub fn callback_name(fn_ptr: usize) -> &'static str {
+    imp::resolve_fn_name(fn_ptr)
 }
